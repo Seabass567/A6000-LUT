@@ -56,7 +56,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private static final File CACHE_DIR = new File(LUT_DIR, "LUTCACHE");
     private static final File DCIM_DIR = new File(
             Environment.getExternalStorageDirectory(), "DCIM");
-    private static final String OFF_NAME = "OFF（关闭）";
+    private static final String OFF_NAME = "OFF";
 
     // 扫描码
     private static final int SCAN_MENU = 514;
@@ -69,6 +69,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private static final int SCAN_DIAL2_CW = 528;
     private static final int SCAN_DIAL2_CCW = 529;
     private static final int SCAN_UP = 103;
+    // rx100: the wheel (KURU), DIAL_3 and four-way left/right, so bodies without the A6000's two dials still have
+    // a route for choose and strength. Codes from Recipe Lab's Keys (docs/DEVELOPMENT.md, key scan codes).
+    private static final int SCAN_KURU_CW = 522;
+    private static final int SCAN_KURU_CCW = 523;
+    private static final int SCAN_DIAL3_CW = 635;
+    private static final int SCAN_DIAL3_CCW = 634;
+    private static final int SCAN_LEFT = 105;
+    private static final int SCAN_RIGHT = 106;
     private static final int SCAN_DOWN = 108;
 
     private SurfaceHolder surfaceHolder;
@@ -76,6 +84,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     private HudView hud;
     private volatile CameraEx camera; // shutdown/kick 线程会置换句柄
     private boolean previewStarted = false;
+    /** rx100: why this body can't take a LUT (no gamma table or RGB matrix), or null when it can. Set on camera open. */
+    private volatile String unsupported = null;
     private boolean surfaceReady = false; // surfaceCreated/Destroyed 维护，
                                           // initCamera 靠它决定能否直接 startPreview
     private volatile boolean takingPicture = false;
@@ -146,7 +156,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         lutListView = (TextView) findViewById(R.id.lutList);
         bottomHint = (TextView) findViewById(R.id.bottomHint);
         hud = (HudView) findViewById(R.id.hud);
-        bottomHint.setText("拨轮1:选择  拨轮2:强度  确认:选定  删除:关闭  MENU:退出");
+        bottomHint.setText("Up/down, wheel: choose   Left/right: strength   Centre: select   Trash: off   MENU: exit");
 
         HandlerThread t = new HandlerThread("lut-worker");
         t.start();
@@ -208,6 +218,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 return;
             }
             camera = CameraEx.open(0, null);
+            unsupported = checkSupport();
             camera.setShutterListener(this);
             // AF 状态监听：驱动取景中央对焦框。
             // 回调线程不确定，只打 Log 并切主线程改 UI，不碰 camera native 调用
@@ -244,7 +255,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         } catch (Throwable t) {
             Log.e(TAG, "CameraEx.open failed", t);
             prepLog("CameraEx.open failed " + t);
-            topBar.setText("相机打开失败: " + t);
+            topBar.setText("Camera failed to open: " + t);
             return;
         } finally {
             camLock.unlock();
@@ -255,6 +266,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
         maybeStartPreview("initCamera");
         refreshTopBar();
+        if (unsupported != null) {
+            topBar.setText(unsupported);
+        }
         // 恢复之前应用的 LUT（从播放界面返回等场景）
         if (appliedIndex > 0 && baseParams != null) {
             writePipeline(baseParams.withIntensity(intensity));
@@ -574,7 +588,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     cameraNullTicks = 0;
                     Log.e(TAG, "preview tick: camera never opened, give up");
                     prepLog("tick: camera null, gave up");
-                    topBar.setText("相机初始化失败，请退出重进");
+                    topBar.setText("Camera setup failed. Exit and reopen the app.");
                     return; // 停表
                 }
                 mainHandler.postDelayed(this, 1500);
@@ -648,7 +662,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         if (stage > 2) {
             Log.e(TAG, "preview kick gave up");
             prepLog("preview kick gave up");
-            topBar.setText("取景异常，请退出重进");
+            topBar.setText("Live view problem. Exit and reopen the app.");
             return;
         }
         new Thread("sonylut-preview-kick") {
@@ -703,6 +717,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         intent.putExtra("large_category", "CATEGORY_REC");
         intent.putExtra("small_category", "APP_SHOOTING");
         sendBroadcast(intent);
+    }
+
+    /**
+     * rx100: whether this body takes the custom gamma table and the RGB matrix the LUT is written as. Null when it
+     * takes both, else what to show. The answer goes to LUTCACHE/PREPLOG.TXT on the card either way, as the
+     * evidence for docs/findings.md. Called with camLock held, right after CameraEx.open.
+     */
+    private String checkSupport() {
+        try {
+            Camera.Parameters p = camera.getNormalCamera().getParameters();
+            CameraEx.ParametersModifier mod = camera.createParametersModifier(p);
+            boolean gamma = mod.isExtendedGammaTableSupported();
+            boolean matrix = mod.isRGBMatrixSupported();
+            prepLog("support: model=" + android.os.Build.MODEL + " gamma=" + gamma + " matrix=" + matrix);
+            if (gamma && matrix) {
+                return null;
+            }
+            String what = !gamma && !matrix ? "a tone curve or a colour matrix" : !gamma ? "a tone curve" : "a colour matrix";
+            return "This camera can't take " + what + ". Nothing was changed.";
+        } catch (Throwable t) {                     // a method this firmware lacks arrives as NoSuchMethodError
+            prepLog("support check failed " + t);
+            return "Couldn't check this camera's support (" + t.getClass().getSimpleName() + "). Nothing was changed.";
+        }
     }
 
     /** 持久化尸检日志：冻机后也能从 SD 卡 PREPLOG.TXT 读出卡在哪一步。 */
@@ -776,9 +813,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
     }
 
     private void showStartupProgress(String name) {
-        String s = "正在计算新增LUT";
+        String s = "Preparing new LUTs";
         if (name != null) {
-            s += "（" + name + "）";
+            s += " (" + name + ")";
         }
         s += "\n" + startupDone + "/" + startupTotal;
         lutListView.setText(s);
@@ -879,11 +916,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
         }
         String s;
         if (cubeFiles.isEmpty()) {
-            s = "SD卡 /LUTS 下未发现 .cube 文件";
+            s = "No .cube files in /LUTS on the card";
         } else if (appliedIndex == 0) {
-            s = "未应用 LUT";
+            s = "No LUT";
         } else {
-            s = displayName(appliedIndex) + "   强度 " + intensity + "%";
+            s = displayName(appliedIndex) + "   strength " + intensity + "%";
         }
         topBar.setText(s);
     }
@@ -923,7 +960,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             refreshListView();
             return;
         }
-        topBar.setText(displayName(index) + "   计算中...");
+        topBar.setText(displayName(index) + "   preparing...");
         worker.post(new Runnable() {
             public void run() {
                 final LutParams params;
@@ -933,7 +970,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                     Log.e(TAG, "decompose failed", t);
                     mainHandler.post(new Runnable() {
                         public void run() {
-                            topBar.setText("分解失败");
+                            topBar.setText("Couldn't convert this LUT");
                         }
                     });
                     return;
@@ -992,6 +1029,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
 
     /** 写管线（主线程）。params=null 表示关闭。持 camLock 与 shutdown/kick 互斥。 */
     private void writePipeline(LutParams params) {
+        if (unsupported != null) {                 // rx100: never touch a pipeline this body doesn't have
+            Log.i(TAG, "writePipeline skipped: " + unsupported);
+            return;
+        }
         if (camera == null) {
             return;
         }
@@ -1026,7 +1067,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
                 Log.i(TAG, "pipeline written");
             } catch (Throwable t) {
                 Log.e(TAG, "writePipeline failed", t);
-                topBar.setText("写入失败: " + t);
+                topBar.setText("Write failed: " + t);
             }
         } finally {
             camLock.unlock();
@@ -1523,8 +1564,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             }
             return true;
         }
-        boolean prev = (scan == SCAN_DIAL1_CCW || scan == SCAN_UP);
-        boolean next = (scan == SCAN_DIAL1_CW || scan == SCAN_DOWN);
+        boolean prev = (scan == SCAN_DIAL1_CCW || scan == SCAN_KURU_CCW || scan == SCAN_UP);
+        boolean next = (scan == SCAN_DIAL1_CW || scan == SCAN_KURU_CW || scan == SCAN_DOWN);
         if (prev || next) {
             if (!browsing) {
                 browsing = true;
@@ -1538,8 +1579,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback,
             debouncePreview();
             return true;
         }
-        boolean intDown = (scan == SCAN_DIAL2_CCW);
-        boolean intUp = (scan == SCAN_DIAL2_CW);
+        boolean intDown = (scan == SCAN_DIAL2_CCW || scan == SCAN_DIAL3_CCW || scan == SCAN_LEFT);
+        boolean intUp = (scan == SCAN_DIAL2_CW || scan == SCAN_DIAL3_CW || scan == SCAN_RIGHT);
         if (intDown || intUp) {
             intensity = Math.max(0, Math.min(100, intensity + (intUp ? 5 : -5)));
             applyIntensity();
